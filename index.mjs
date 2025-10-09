@@ -7,11 +7,11 @@ import { createHmac } from 'crypto';
 
 const s3 = new S3();
 
-async function callWebhookWithRetry(payload, apiKey, signature, maxRetries = 3, initialDelay = 2000) {
+async function callWebhookWithRetry(webhookUrl, payload, apiKey, signature, maxRetries = 3, initialDelay = 2000) {
     for (let attempt = 0; attempt < maxRetries; attempt++) {
         try {
             const webhookResponse = await axios.post(
-                process.env.WEBHOOK_URL,
+                webhookUrl,
                 payload,
                 {
                     headers: {
@@ -21,10 +21,10 @@ async function callWebhookWithRetry(payload, apiKey, signature, maxRetries = 3, 
                     }
                 }
             );
-            console.log('Webhook response:', webhookResponse.data);
+            console.log(`Webhook response from ${webhookUrl}:`, webhookResponse.data);
             return webhookResponse;
         } catch (error) {
-            console.error(`Webhook attempt ${attempt + 1} failed:`, error.message);
+            console.error(`Webhook attempt ${attempt + 1} failed for ${webhookUrl}:`, error.message);
             
             if (attempt === maxRetries - 1) {
                 throw error; // Throw on final attempt
@@ -129,9 +129,34 @@ export const handler = async (event) => {
 
         // Call webhook API
         try {
-            await callWebhookWithRetry(payload, apiKey, signature);
+            const primaryUrl = process.env.WEBHOOK_URL;
+            if (!primaryUrl) {
+                throw new Error('WEBHOOK_URL is not configured');
+            }
+
+            const trialUrl = process.env.WEBHOOK_TRIAL_URL;
+
+            const webhookCalls = [
+                { name: 'primary', execute: () => callWebhookWithRetry(primaryUrl, payload, apiKey, signature) }
+            ];
+
+            if (trialUrl) {
+                webhookCalls.push({ name: 'trial', execute: () => callWebhookWithRetry(trialUrl, payload, apiKey, signature) });
+            }
+
+            const results = await Promise.allSettled(webhookCalls.map(({ execute }) => execute()));
+
+            const primaryResult = results[0];
+            if (primaryResult.status === 'rejected') {
+                console.error('Primary webhook failed:', primaryResult.reason);
+                throw primaryResult.reason;
+            }
+
+            if (results[1] && results[1].status === 'rejected') {
+                console.error('Trial webhook failed independently:', results[1].reason);
+            }
         } catch (webhookError) {
-            console.error('All webhook retries failed:', webhookError);
+            console.error('Webhook processing encountered an error:', webhookError);
             throw webhookError; // Re-throw the error to let SQS handle retry
         }
 
